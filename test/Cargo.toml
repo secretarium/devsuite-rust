@@ -1,0 +1,13 @@
+[package]
+name = "test-klave-connector"
+version = "0.1.0"
+edition = "2021"
+description = ""
+
+[dependencies]
+env_logger = "0.11.8"
+klave-connector = { path = "../libs/connector" }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+serde_json = "1.0.140"
+uuidv4 = "1.0.0"
