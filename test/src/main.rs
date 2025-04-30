@@ -5,7 +5,7 @@ use klave_connector::{SCP, Key};
 pub const KLAVE_TEST: &str = "<Use your own URL>";
 // #[tokio::main]
 // async fn main() {    
-//     let mut client = SCP::new("wss://klave-dev.secretarium.org/", None, None);
+//     let mut client = SCP::new("<your-endpoint>", None, None);
 
 //     match client.connect().await {
 //         Ok(_) => println!("Connected to Klave successfully."),
@@ -16,7 +16,7 @@ pub const KLAVE_TEST: &str = "<Use your own URL>";
 //     };
 
 //     // Send a transaction
-//     let mut tx = client.new_tx("wasm-manager", "version", None, None).await;
+//     let mut tx = client.new_tx("<your-app>", "version", None, None).await;
 //     tx.on_error(|request_id, error_message| {
 //         eprintln!("Transaction error occurred. RequestId: {:?}, Error: {:?}", request_id, error_message);
 //     });
@@ -59,7 +59,7 @@ async fn main() {
     sleep(Duration::from_secs(2)).await;
 
     println!("Sending a transaction with custom callbacks...");
-    let mut tx = client.new_tx("wasm-manager", "version", None, None).await;
+    let mut tx = client.new_tx("<your-app>", "version", None, None).await;
     tx.on_error(|request_id, error_message| {
         eprintln!("Transaction error occurred. RequestId: {:?}, Error: {:?}", request_id, error_message);
     });
@@ -77,13 +77,13 @@ async fn main() {
     sleep(Duration::from_secs(5)).await;
 
     println!("Sending a transaction with default callbacks...");
-    let tx_default = client.new_tx("wasm-manager", "version", None, None).await;
+    let tx_default = client.new_tx("<your-app>", "version", None, None).await;
     let _ = tx_default.send().await;
 
     sleep(Duration::from_secs(5)).await;
 
     let wasm_bytes_b64 = std::fs::read_to_string("<Use your own File>").expect("Unable to read file");
-    let tx_chunk = client.new_tx("wasm-manager", "deploy_instance", None, Some(HashMap::from([
+    let tx_chunk = client.new_tx("<your-app>", "deploy_instance", None, Some(HashMap::from([
         ("wasm_bytes_b64".to_string(), wasm_bytes_b64.clone()),
         ("app_id".to_string(), "<my-app>-rust-connector".to_string()),
         ("fqdn".to_string(), "main.<my-app>.klave.network".to_string()),
@@ -96,7 +96,7 @@ async fn main() {
     sleep(Duration::from_secs(5)).await;
 
     println!("Sending periodic calls...");
-    let tx3_periodic = client.new_periodic_tx("wasm-manager", "version", None, None, 5).await;
+    let tx3_periodic = client.new_periodic_tx("<your-app>", "version", None, None, 5).await;
     let _ = tx3_periodic.send().await;
 
     // Keep the main task alive until you decide to close the connection

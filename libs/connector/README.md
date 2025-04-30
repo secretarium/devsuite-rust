@@ -45,7 +45,7 @@ use klave_connector::Key;
 
 #[tokio::main]
 async fn main() {    
-    let mut client = SCP::new("wss://klave-dev.secretarium.org/", None, None);
+    let mut client = SCP::new("<wss://your-endpoint>", None, None);
 
     match client.connect().await {
         Ok(_) => println!("Connected to Klave successfully."),
@@ -56,7 +56,7 @@ async fn main() {
     };
 
     // Send a transaction
-    let mut tx = client.new_tx("wasm-manager", "version", None, None).await;
+    let mut tx = client.new_tx("<your-app>", "<your-route>", None, None).await;
     tx.on_error(|request_id, error_message| {
         eprintln!("Transaction error occurred. RequestId: {:?}, Error: {:?}", request_id, error_message);
     });
