@@ -1,10 +1,9 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tokio::time::Duration;
 
 use crate::scp::SCP;
-use crate::types::SCPMessage;
+use crate::types::{Args, OptionalArgs, SCPMessage};
 
 type Callback = Arc<dyn Fn(Option<&str>, Option<&str>) + Send + Sync>;
 
@@ -20,6 +19,7 @@ pub struct TransactionNotificationHandlers {
     pub on_acknowledged: Vec<Callback>,
     pub on_committed: Vec<Callback>,
     pub on_executed: Vec<Callback>,
+    pub promise_message: Vec<Callback>,
     pub periodic_message: Option<PeriodicMessage>,
 }
 
@@ -31,6 +31,7 @@ impl Clone for TransactionNotificationHandlers {
             on_acknowledged: self.on_acknowledged.clone(), 
             on_committed: self.on_committed.clone(), 
             on_executed: self.on_executed.clone(), 
+            promise_message: self.promise_message.clone(),
             periodic_message: None,
         }
     }
@@ -57,6 +58,7 @@ impl TransactionNotificationHandlers {
             on_acknowledged: Vec::new(),
             on_committed: Vec::new(),
             on_executed: Vec::new(),
+            promise_message: Vec::new(),
             periodic_message: None,
         }
     }
@@ -66,12 +68,13 @@ impl Default for TransactionNotificationHandlers {
     fn default() -> Self {
         Self {
             on_error: vec![Arc::new(|error_code, error_message| {
-                eprintln!("Default OnError. Code: {:?}, Message: {:?}", error_code, error_message);})],            
+                println!("Default OnError. Code: {:?}, Message: {:?}", error_code, error_message);})],            
             on_result: vec![Arc::new(|code, message| {
-                eprintln!("Default OnResult. Code: {:?}, Message: {:?}", code, message);})],            
+                println!("Default OnResult. Code: {:?}, Message: {:?}", code, message);})],            
             on_acknowledged: Vec::new(),
             on_committed: Vec::new(),
             on_executed: Vec::new(),
+            promise_message: Vec::new(),
             periodic_message: None,
         }
     }
@@ -83,7 +86,7 @@ pub struct Tx<'a> {
     app: String,
     command: String,
     request_id: String,
-    args: Option<HashMap<String, String>>,
+    args: OptionalArgs,
     cbs: TransactionNotificationHandlers,
     response_promise: Option<tokio::sync::oneshot::Receiver<String>>,
 }
@@ -94,20 +97,21 @@ impl<'a> Tx<'a> {
         app: String,
         command: String,
         request_id: String,
-        args: Option<HashMap<String, String>>,
+        args: OptionalArgs,
         periodic_interval: Option<Duration>,
     ) -> Self {
         let (tx, rx) = oneshot::channel();
         let tx = Arc::new(AsyncMutex::new(Some(tx)));
         let mut cbs = TransactionNotificationHandlers::new();
+
         let tx_clone = Arc::clone(&tx);
-        cbs.on_result.push(Arc::new(move |_, result| {
-            if let Some(result) = result {
-                let result_cloned = result.to_string(); // Clone the result to ensure it has a 'static lifetime
+        cbs.promise_message.push(Arc::new(move |_, message| {
+            if let Some(message) = message {
+                let message_cloned = message.to_string(); // Clone the result to ensure it has a 'static lifetime
                 let tx_clone = Arc::clone(&tx_clone);
                 tokio::spawn(async move {
                     if let Some(tx) = tx_clone.lock().await.take() {
-                        let _ = tx.send(result_cloned);
+                        let _ = tx.send(message_cloned);
                     }
                 });
             }
@@ -121,8 +125,9 @@ impl<'a> Tx<'a> {
                     function: command.clone(),
                     request_id: request_id.clone(),
                     args: match args.clone() {
-                        Some(args) => Some(serde_json::to_string(&args).unwrap()),
-                        None => Some("{}".to_string()),
+                        Some(Args::Map(map)) => serde_json::to_string(&map).unwrap(),
+                        Some(Args::Str(s)) => s,
+                        None => String::from("{}"),
                     },
                 }
             });
@@ -187,13 +192,8 @@ impl<'a> Tx<'a> {
     }
     
     pub async fn send(mut self) -> Result<String, String> {
-        let app = self.app.clone();
-        let command = self.command.clone();
-        let request_id = self.request_id.clone();
-        let args = self.args.clone();
-
-        self.ws_client.requests.lock().await.insert(request_id.clone(), Arc::new(AsyncMutex::new(self.cbs)));
-        self.ws_client.send(app, command, request_id, args).await;
+        self.ws_client.requests.lock().await.insert(self.request_id.clone(), Arc::new(AsyncMutex::new(self.cbs)));
+        self.ws_client.send(&self.app, &self.command, &self.request_id, self.args).await;
 
         // Wait for the response
         if let Some(rx) = self.response_promise.take() {

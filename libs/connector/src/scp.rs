@@ -19,11 +19,15 @@ use crate::cluster_negotiation::HandshakeError;
 use crate::gateway_handshake::{self, Handshaker};
 use crate::key::Key;
 use crate::tx::{TransactionNotificationHandlers, Tx};
+use crate::types::OptionalArgs;
 use crate::types::{SCPEndpoint, SCPMessage, SCPOptions, SCPSession};
 use crate::utils::{get_random_bytes, increment_by};
+use crate::Args;
 
 pub type MessageCallback = Arc<dyn Fn(&str) + Send + Sync + 'static>;
 pub type HandshakeFn = Arc<dyn Fn(&mut WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>) -> BoxFuture<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + Sync + 'static>;
+
+pub const CHUNK_SIZE: usize = 524_288; // 512 KB
 
 #[derive(Debug)]
 pub enum ConnectionState {
@@ -83,7 +87,15 @@ pub struct SCP {
     shutdown_signal: Option<watch::Sender<bool>>,
 }
 
-pub const CHUNK_SIZE: usize = 524_288; // 512 KB
+impl Display for SCP {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SCP {{ endpoint: {}, user_key: {}, options: {:?}, connection_state: {} }}", 
+            self.endpoint.url, 
+            self.user_key, 
+            self.options, 
+            self.connection_state)
+    }
+}
 
 impl SCP {
     pub fn new(url: &str, user_key: Option<&Key>, known_trusted_key: Option<&str>) -> Self {
@@ -104,7 +116,7 @@ impl SCP {
             },
             user_key: match user_key {
                 Some(key) => key.clone(),
-                None => Key::new(None),
+                None => Key::new(None)
             },
             options: None,
             session: Arc::new(AsyncMutex::new(None)),
@@ -249,8 +261,8 @@ impl SCP {
             for callback in handlers.iter() {
                 callback(Some(request_id), response);
             }
-
-        } else if !default_handlers.is_empty() {
+        }
+        else if !default_handlers.is_empty() {
             for callback in default_handlers.iter() {
                 callback(Some(request_id), response);
             }
@@ -297,7 +309,7 @@ impl SCP {
                                                 let requests = requests.lock().await;           
                                                 let default_handlers = requests.get("default").unwrap().lock().await;  
                                                 if let Some(handlers) = requests.get(&request_id) {
-                                                    let handlers = handlers.lock().await;
+                                                    let mut handlers = handlers.lock().await;
                                                     if handlers.periodic_message.is_some() {
                                                         //Update periodic_timers if request_id does not already exist
                                                         if periodic_timers.get(&request_id).is_none() {
@@ -315,19 +327,35 @@ impl SCP {
                                                             None => &format!("{}", serde_json::to_string(&json_value["result"]).unwrap()),
                                                         };
                                                         Self::handle_response(&handlers.on_result, &default_handlers.on_result, &request_id, Some(result_value)).await;
+                                                        if let Some(callback) = handlers.promise_message.pop() {
+                                                            callback(Some(&request_id), Some("Promise message received"));
+                                                        }                                            
                                                     } else if json_value.get("error").is_some() {
                                                         let error_value = match json_value["error"].as_str() {
                                                             Some(value) => value,
                                                             None => &format!("{}", serde_json::to_string(&json_value["result"]).unwrap()),
                                                         };
                                                         Self::handle_response(&handlers.on_error, &default_handlers.on_error, &request_id, Some(error_value)).await;
+                                                        if let Some(callback) = handlers.promise_message.pop() {
+                                                            callback(Some(&request_id), Some("Promise message received"));
+                                                        }                                            
                                                     } else if json_value.get("state").is_some() {
                                                         let state_value = json_value["state"].as_str().unwrap_or("");
                                                         match state_value {
                                                             "Acknowledged" => Self::handle_response(&handlers.on_acknowledged, &default_handlers.on_acknowledged, &request_id, Some("Acknowledged")).await,
                                                             "Committed" => Self::handle_response(&handlers.on_committed, &default_handlers.on_committed, &request_id, Some("Committed")).await,
-                                                            "Executed" => Self::handle_response(&handlers.on_executed, &default_handlers.on_executed, &request_id, Some("Executed")).await,
-                                                            "Failed" => Self::handle_response(&handlers.on_error, &default_handlers.on_error, &request_id, Some("Failed")).await,
+                                                            "Executed" => {
+                                                                Self::handle_response(&handlers.on_executed, &default_handlers.on_executed, &request_id, Some("Executed")).await;
+                                                                if let Some(callback) = handlers.promise_message.pop() {
+                                                                    callback(Some(&request_id), Some("Promise message received"));
+                                                                }                                            
+                                                                    }
+                                                            "Failed" => {
+                                                                Self::handle_response(&handlers.on_error, &default_handlers.on_error, &request_id, Some("Failed")).await;
+                                                                if let Some(callback) = handlers.promise_message.pop() {
+                                                                    callback(Some(&request_id), Some("Promise message received"));
+                                                                }                                            
+                                                            }
                                                             _ => {
                                                                 println!("Received unknown state: {:?}", state_value);
                                                             }
@@ -416,19 +444,24 @@ impl SCP {
 
     pub async fn send(
         &mut self,
-        app: String,
-        command: String,
-        request_id: String,
-        args: Option<HashMap<String, String>>,
+        app: &str,
+        command: &str,
+        request_id: &str,
+        args: OptionalArgs,
     ) {
         if let Some(sender) = self.sender.clone() {
             let message = SCPMessage {
-                dcapp: app,
-                function: command,
-                request_id: request_id,
+                dcapp: app.to_string(),
+                function: command.to_string(),
+                request_id: request_id.to_string(),
                 args: match args {
-                    Some(args) => Some(serde_json::to_string(&args).unwrap()),
-                    None => Some("{}".to_string()),
+                    Some(args) => {
+                        match args {
+                            Args::Map(map) => serde_json::to_string(&map).unwrap(),
+                            Args::Str(s) => s,
+                        }
+                    }
+                    None => "{}".to_string(),
                 },
             };
             let query_str = serde_json::to_string(&message).unwrap();
@@ -471,7 +504,7 @@ impl SCP {
         Ok(())
     }
 
-    pub async fn new_tx(&mut self, app: &str, command: &str, request_id: Option<String>, args: Option<HashMap<String, String>>) -> Tx {        
+    pub async fn new_tx(&mut self, app: &str, command: &str, request_id: Option<String>, args: OptionalArgs) -> Tx {        
         let rid = request_id.unwrap_or_else(|| {
             let random_bytes = get_random_bytes(8);
             format!("rid-{}-{}-{}", app, command, hex::encode(random_bytes))            
@@ -486,7 +519,7 @@ impl SCP {
         ).await
     }
 
-    pub async fn new_periodic_tx(&mut self, app: &str, command: &str, request_id: Option<String>, args: Option<HashMap<String, String>>, interval_secs: u64) -> Tx {        
+    pub async fn new_periodic_tx(&mut self, app: &str, command: &str, request_id: Option<String>, args: OptionalArgs, interval_secs: u64) -> Tx {        
         let rid = request_id.unwrap_or_else(|| {
             let random_bytes = get_random_bytes(8);
             format!("rid-{}-{}-{}", app, command, hex::encode(random_bytes))            

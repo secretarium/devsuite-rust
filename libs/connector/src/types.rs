@@ -1,6 +1,8 @@
 use aes_gcm::Aes128Gcm;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
+#[derive(Debug, Clone)]
 pub struct SCPEndpoint {
     pub url: String,
     pub known_trusted_key: Option<String>,
@@ -36,10 +38,18 @@ pub struct SCPProto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Args {
+    Map(HashMap<String, String>),
+    Str(String),
+}
+
+pub type OptionalArgs = Option<Args>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SCPMessage {
     pub dcapp: String,
     pub function: String,    
     #[serde(rename = "requestId")]
     pub request_id: String,
-    pub args: Option<String>,
+    pub args: String,
 }
