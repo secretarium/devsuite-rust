@@ -328,7 +328,7 @@ impl SCP {
                                                         };
                                                         Self::handle_response(&handlers.on_result, &default_handlers.on_result, &request_id, Some(result_value)).await;
                                                         if let Some(callback) = handlers.promise_message.pop() {
-                                                            callback(Some(&request_id), Some("Promise message received"));
+                                                            callback(Some(&request_id), Some(result_value));
                                                         }                                            
                                                     } else if json_value.get("error").is_some() {
                                                         let error_value = match json_value["error"].as_str() {
@@ -337,7 +337,7 @@ impl SCP {
                                                         };
                                                         Self::handle_response(&handlers.on_error, &default_handlers.on_error, &request_id, Some(error_value)).await;
                                                         if let Some(callback) = handlers.promise_message.pop() {
-                                                            callback(Some(&request_id), Some("Promise message received"));
+                                                            callback(Some(&request_id), Some(error_value));
                                                         }                                            
                                                     } else if json_value.get("state").is_some() {
                                                         let state_value = json_value["state"].as_str().unwrap_or("");
@@ -347,13 +347,13 @@ impl SCP {
                                                             "Executed" => {
                                                                 Self::handle_response(&handlers.on_executed, &default_handlers.on_executed, &request_id, Some("Executed")).await;
                                                                 if let Some(callback) = handlers.promise_message.pop() {
-                                                                    callback(Some(&request_id), Some("Promise message received"));
+                                                                    callback(Some(&request_id), Some("Executed"));
                                                                 }                                            
                                                                     }
                                                             "Failed" => {
                                                                 Self::handle_response(&handlers.on_error, &default_handlers.on_error, &request_id, Some("Failed")).await;
                                                                 if let Some(callback) = handlers.promise_message.pop() {
-                                                                    callback(Some(&request_id), Some("Promise message received"));
+                                                                    callback(Some(&request_id), Some("Failed"));
                                                                 }                                            
                                                             }
                                                             _ => {
