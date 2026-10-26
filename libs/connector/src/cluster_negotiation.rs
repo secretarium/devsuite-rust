@@ -70,6 +70,8 @@ pub enum HandshakeError {
     Utf8(#[from] std::str::Utf8Error),
     #[error("ASN.1 decode error: {0}")]
     Asn1Decode(String),
+    #[error("Server identity does not match the known trusted key")]
+    UntrustedServer,
     #[error("Handshake failed: {0}")]
     Generic(String),
 }
@@ -155,11 +157,10 @@ fn extract_key_and_iv(server_identity_bytes: &[u8], ecdh_secret: &SecretKey) -> 
     let pre_master_secret = &server_identity_bytes[0..32];
     let server_ecdh_pub_key_bytes = &server_identity_bytes[32..96];
     
-    let server_ecdh_public_key = EcdhPublicKey::from_encoded_point(
-        &EncodedPoint::from_bytes(
-            [&[0x04], server_ecdh_pub_key_bytes].concat()
-        ).unwrap()
-    ).unwrap();
+    let server_ecdh_public_key = EncodedPoint::from_bytes([&[0x04], server_ecdh_pub_key_bytes].concat())
+        .ok()
+        .and_then(|point| EcdhPublicKey::from_encoded_point(&point).into_option())
+        .ok_or_else(|| HandshakeError::Generic("Invalid server ECDH public key".into()))?;
 
     // Compute the shared secret using the SecretKey
     let shared_secret = elliptic_curve::ecdh::diffie_hellman(
@@ -228,12 +229,19 @@ pub async fn process<'a>(
             temp
         }
     };
-    let client_proof_of_work = [pow, trusted_key].concat();
+    let client_proof_of_work = [pow, trusted_key.clone()].concat();
 
     send_bytes(&mut writer, &client_proof_of_work).await?;
 
     // --- Server Identity ---
     let server_identity_bytes = read_n_bytes(& mut reader, 32 + 64 + 64, connect_timeout).await?;
+
+    // The server identity ends with the key the server proves it holds. When the caller knows the
+    // cluster's trusted key, the server must present exactly that key, otherwise any server holding
+    // any key could complete the handshake. (Without a known trusted key, the server is not authenticated.)
+    if known_trusted_key.is_some() && server_identity_bytes[96..160] != trusted_key[..] {
+        return Err(HandshakeError::UntrustedServer.into());
+    }
 
     let (key, iv) = extract_key_and_iv(&server_identity_bytes, &ecdh_private_key)?;
     let crypto_key = Aes128Gcm::new(key.as_slice().into());
@@ -264,17 +272,20 @@ pub async fn process<'a>(
         decrypt_data(&session, &server_proof_of_identity_encrypted)?
     };
 
+    if server_proof_of_identity.len() < 96 {
+        return Err(HandshakeError::Generic("Server proof of identity is too short".into()).into());
+    }
     let welcome = b"Hey you! Welcome to Secretarium!";
     let to_verify = [&server_proof_of_identity[0..32], welcome].concat();
-    
-    let server_signature = Signature::from_slice(&server_proof_of_identity[32..96]).unwrap();
+
+    let server_signature = Signature::from_slice(&server_proof_of_identity[32..96])
+        .map_err(|_| HandshakeError::Generic("Invalid server signature".into()))?;
     let server_ecdsa_pub_key_bytes = &server_identity_bytes[96..160];
 
-    let server_ecdsa_verifying_key = VerifyingKey::from_encoded_point(
-        &EncodedPoint::from_bytes(
-            [&[0x04], server_ecdsa_pub_key_bytes].concat()
-        ).unwrap()
-    ).unwrap();
+    let server_ecdsa_verifying_key = EncodedPoint::from_bytes([&[0x04], server_ecdsa_pub_key_bytes].concat())
+        .ok()
+        .and_then(|point| VerifyingKey::from_encoded_point(&point).ok())
+        .ok_or_else(|| HandshakeError::Generic("Invalid server ECDSA public key".into()))?;
     if server_ecdsa_verifying_key.verify(&to_verify, &server_signature).is_err() {
         return Err(HandshakeError::Generic("ECDSA verification failed".into()).into());
     }        

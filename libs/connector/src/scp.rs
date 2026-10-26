@@ -61,6 +61,9 @@ pub fn encrypt_data(session: &SCPSession, data: &[u8], iv_offset: &[u8]) -> Resu
 }
 
 pub fn decrypt_data(session: &SCPSession, encrypted_data: &[u8]) -> Result<Vec<u8>, HandshakeError> {
+    if encrypted_data.len() < 16 {
+        return Err(HandshakeError::Generic("Encrypted data is too short".into()));
+    }
     let iv_offset = encrypted_data[0..16].to_vec();
     let iv: [u8; 12] = increment_by(session.iv.as_slice(), iv_offset.as_slice()).unwrap()[0..12]
         .try_into()
@@ -197,7 +200,7 @@ impl SCP {
         return encrypted.to_vec();                               
     }
 
-    async fn send_chunked(
+    pub(crate) async fn send_chunked(
         write: &mut futures::stream::SplitSink<WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>, Message>,
         data: &[u8],
         chunk_size: usize,
@@ -293,11 +296,22 @@ impl SCP {
                 result = read.next() => {
                     match result {
                         Some(Ok(msg)) => {
-                            if msg.is_binary() {                                
-                                let buffer = msg.into_data()[4..].to_vec();
+                            if msg.is_binary() {
+                                let data = msg.into_data();
+                                if data.len() < 4 {
+                                    eprintln!("Ignoring a frame shorter than its header.");
+                                    continue;
+                                }
+                                let buffer = data[4..].to_vec();
                                 let session = session.lock().await;
-                                if let Some(ref scp_session) = *session {                                    
-                                    let decrypted = decrypt_data(&scp_session, &buffer).unwrap();
+                                if let Some(ref scp_session) = *session {
+                                    let decrypted = match decrypt_data(&scp_session, &buffer) {
+                                        Ok(decrypted) => decrypted,
+                                        Err(e) => {
+                                            eprintln!("Ignoring a frame that could not be decrypted: {}", e);
+                                            continue;
+                                        }
+                                    };
                                     match String::from_utf8(decrypted) {
                                         Ok(text) => {
                                             if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -324,7 +338,7 @@ impl SCP {
                                                     if json_value.get("result").is_some() {
                                                         let result_value = match json_value["result"].as_str() {
                                                             Some(value) => value,
-                                                            None => &format!("{}", serde_json::to_string(&json_value["result"]).unwrap()),
+                                                            None => &format!("{}", json_value["result"]),
                                                         };
                                                         Self::handle_response(&handlers.on_result, &default_handlers.on_result, &request_id, Some(result_value)).await;
                                                         if let Some(callback) = handlers.promise_message.pop() {
@@ -333,7 +347,7 @@ impl SCP {
                                                     } else if json_value.get("error").is_some() {
                                                         let error_value = match json_value["error"].as_str() {
                                                             Some(value) => value,
-                                                            None => &format!("{}", serde_json::to_string(&json_value["result"]).unwrap()),
+                                                            None => &format!("{}", json_value["error"]),
                                                         };
                                                         Self::handle_response(&handlers.on_error, &default_handlers.on_error, &request_id, Some(error_value)).await;
                                                         if let Some(callback) = handlers.promise_message.pop() {
@@ -466,7 +480,10 @@ impl SCP {
             };
             let query_str = serde_json::to_string(&message).unwrap();
             let query_bytes = query_str.as_bytes();
-            sender.send(query_bytes.to_vec()).await.unwrap();
+            // The connection task may have ended (server closed): report instead of panicking.
+            if sender.send(query_bytes.to_vec()).await.is_err() {
+                eprintln!("Error sending message: connection closed.");
+            }
         }
     }
 
