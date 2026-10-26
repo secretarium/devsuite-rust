@@ -5,7 +5,9 @@ pub mod key;
 pub mod gateway_handshake;
 pub mod cluster_negotiation;
 pub mod utils;
+pub mod channel;
 
 pub use scp::SCP as SCP;
 pub use key::Key as Key;
 pub use types::Args as Args;
+pub use channel::{ChannelError, ChannelReceiver, ChannelSender};

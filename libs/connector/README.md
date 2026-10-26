@@ -72,6 +72,38 @@ async fn main() {
 }
 ```
 
+### Authenticating the cluster
+
+Pass the cluster's trusted key (64 bytes, URL-safe base64) as the third argument of `SCP::new`. The handshake then
+fails with `HandshakeError::UntrustedServer` unless the server presents that key. Without a trusted key the server
+is not authenticated.
+
+### The secure channel: `channel`
+
+`channel` is the Secretarium Connection Protocol alone. `channel::open` connects, runs the handshake (checking the
+trusted key when one is given) and returns a `ChannelSender` and a `ChannelReceiver` of opaque, encrypted messages.
+It knows nothing about what the messages contain; requests to applications are the job of a client built on top of it.
+
+```rust
+use klave_connector::{channel, Key};
+
+let (sender, mut receiver) = channel::open("<wss://your-endpoint>", &Key::new(None), Some("<trusted key>"), None).await?;
+sender.send(b"<message>").await?;
+if let Some(Ok(reply)) = receiver.recv().await {
+    println!("{} bytes", reply.len());
+}
+```
+
+A frame that cannot be decrypted is returned as `ChannelError::Frame` and the channel stays usable.
+`SCP` and `Tx` are unchanged and remain available.
+
+### Tests
+
+`tests/scp_channel.rs` tests the protocol as a secure channel (handshake, server authentication, opaque messages,
+malformed frames, closing) against a mock node that echoes what it receives. The mock node comes from the
+test-utilities crate [`klave-connector-test-utils`](../connector-test-utils), a dev-dependency only, which crates
+built on the channel can use in their own tests too.
+
 ## Features
 
 - **Secure WebSocket Communication**: Establish encrypted WebSocket connections with Klave apps.
