@@ -97,6 +97,16 @@ if let Some(Ok(reply)) = receiver.recv().await {
 A frame that cannot be decrypted is returned as `ChannelError::Frame` and the channel stays usable.
 `SCP` and `Tx` are unchanged and remain available.
 
+### Terminating the session elsewhere: `Terminator`
+
+The channel owns the WebSocket and the framing; a `Terminator` does the cryptography: the client hello, the client's
+proof of identity (signed with the user's key), the check of the server's proof, then the encryption of every
+message. `channel::open` uses a `LocalTerminator`, which does it in this process with the given key.
+`channel::open_with` takes any terminator, for example one in the user's browser: the process that runs the channel
+then holds neither the user's private key nor the session key, and only relays bytes. A terminator that knows the
+cluster's trusted key must check it itself (`LocalTerminator` does). A terminator that is gone
+(`TerminationError::Unavailable`) makes the channel fail with `ChannelError::Transport`.
+
 ### Tests
 
 `tests/scp_channel.rs` tests the protocol as a secure channel (handshake, server authentication, opaque messages,

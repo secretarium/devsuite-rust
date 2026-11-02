@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::{cluster_negotiation, key::Key, types::{SCPOptions, SCPSession}};
 use crate::scp::ConnectionState;
+use crate::terminator::Terminator;
 
 #[derive(Debug)]
 pub struct SCPProto {
@@ -17,17 +18,15 @@ pub struct SCPProto {
 }
 
 
-pub async fn try_gateway_handshake(
-    writer: &mut SplitSink<&mut WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+/// Waits for the gateway's protocol information; returns when none comes within the gateway timeout, which is when
+/// the SCP handshake starts.
+async fn await_gateway(
     reader: &mut SplitStream<&mut WebSocketStream<MaybeTlsStream<TcpStream>>>,
-    user_key: &Key,
-    known_trusted_key: Option<&str>,
-    scp_options: Option<SCPOptions>,
-) -> Result<(SCPSession, ConnectionState), Box<dyn std::error::Error + Send + Sync>> {
+    scp_options: &SCPOptions,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Allocate a buffer to read the initial bytes (at least 4 for skipping)
     let mut total_received = 0;
     let mut proto_info_bytes = Vec::new();
-    let scp_options = scp_options.unwrap_or_else(|| SCPOptions::default());
 
     loop {
         let read_result = tokio::time::timeout(Duration::from_secs(scp_options.gateway_timeout), reader.next()).await;
@@ -65,17 +64,40 @@ pub async fn try_gateway_handshake(
                 // Handle the case where the stream ends gracefully
                 return Err("Connection ended unexpectedly during handshake".into());
             }
-            Err(_timeout) => {
-                let (scp_session, connection_state) = cluster_negotiation::process(
-                    writer, reader, user_key, known_trusted_key, Duration::from_secs(scp_options.connect_timeout)).await?;
-                return Ok((scp_session, connection_state));
-            }
+            Err(_timeout) => return Ok(()),
         }
 
         if total_received > 256 { // Add a safety break to prevent infinite loops on malformed data
             return Err("Received too much data without valid protocol information".into());
         }
     }
+}
+
+pub async fn try_gateway_handshake(
+    writer: &mut SplitSink<&mut WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+    reader: &mut SplitStream<&mut WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    user_key: &Key,
+    known_trusted_key: Option<&str>,
+    scp_options: Option<SCPOptions>,
+) -> Result<(SCPSession, ConnectionState), Box<dyn std::error::Error + Send + Sync>> {
+    let scp_options = scp_options.unwrap_or_default();
+    await_gateway(reader, &scp_options).await?;
+    let (scp_session, connection_state) = cluster_negotiation::process(
+        writer, reader, user_key, known_trusted_key, Duration::from_secs(scp_options.connect_timeout)).await?;
+    Ok((scp_session, connection_state))
+}
+
+/// The same handshake, with the cryptography done by `terminator` ([`crate::terminator`]).
+pub async fn try_gateway_negotiation(
+    writer: &mut SplitSink<&mut WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+    reader: &mut SplitStream<&mut WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    terminator: &dyn Terminator,
+    known_trusted_key: Option<&str>,
+    scp_options: Option<SCPOptions>,
+) -> Result<ConnectionState, Box<dyn std::error::Error + Send + Sync>> {
+    let scp_options = scp_options.unwrap_or_default();
+    await_gateway(reader, &scp_options).await?;
+    Ok(cluster_negotiation::negotiate(writer, reader, terminator, known_trusted_key, Duration::from_secs(scp_options.connect_timeout)).await?)
 }
 
 pub trait Handshaker: Send + Sync + 'static {

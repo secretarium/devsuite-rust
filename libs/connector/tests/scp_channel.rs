@@ -91,3 +91,90 @@ async fn ends_when_the_server_closes() {
     tx.send(b"bye").await.unwrap();
     assert!(next(&mut rx).await.is_none());
 }
+
+// ---------- the cryptography done by a terminator ----------
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use klave_connector::{LocalTerminator, TerminationError, Terminator};
+
+/// A terminator elsewhere: the channel gets only what it returns. It can be made to go away.
+struct Remote {
+    inner: LocalTerminator,
+    gone: AtomicBool,
+}
+
+impl Remote {
+    fn new(trusted_key: Option<&str>) -> Arc<Self> {
+        Arc::new(Self { inner: LocalTerminator::new(Key::new(None), trusted_key).unwrap(), gone: AtomicBool::new(false) })
+    }
+    fn up(&self) -> Result<(), TerminationError> {
+        if self.gone.load(Ordering::SeqCst) {
+            return Err(TerminationError::Unavailable("gone".into()));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Terminator for Remote {
+    async fn hello(&self) -> Result<Vec<u8>, TerminationError> {
+        self.up()?;
+        self.inner.hello().await
+    }
+    async fn identify(&self, server_identity: &[u8]) -> Result<Vec<u8>, TerminationError> {
+        self.up()?;
+        self.inner.identify(server_identity).await
+    }
+    async fn confirm(&self, server_proof: &[u8]) -> Result<(), TerminationError> {
+        self.up()?;
+        self.inner.confirm(server_proof).await
+    }
+    async fn seal(&self, message: &[u8]) -> Result<Vec<u8>, TerminationError> {
+        self.up()?;
+        self.inner.seal(message).await
+    }
+    async fn open(&self, data: &[u8]) -> Result<Vec<u8>, TerminationError> {
+        self.up()?;
+        self.inner.open(data).await
+    }
+}
+
+#[tokio::test]
+async fn a_terminator_does_the_cryptography() {
+    let node = echo_node().await;
+    let t = Remote::new(Some(&node.trusted_key));
+    let (tx, mut rx) = channel::open_with(&node.url, t.clone(), Some(&node.trusted_key), None).await.unwrap();
+    tx.send(b"ping").await.unwrap();
+    assert_eq!(next(&mut rx).await.unwrap().unwrap(), b"ping");
+}
+
+#[tokio::test]
+async fn the_terminator_refuses_an_untrusted_server_whatever_the_channel_says() {
+    // The relaying side gives no trusted key (or a wrong one): the terminator, which knows the cluster's key, refuses.
+    let node = echo_node().await;
+    let t = Remote::new(Some(&other_key()));
+    let err = channel::open_with(&node.url, t, None, None).await.err().expect("must fail");
+    assert!(matches!(&err, ChannelError::Handshake(m) if m.contains("trusted key")), "{err}");
+}
+
+#[tokio::test]
+async fn without_its_terminator_the_channel_is_unusable() {
+    let node = echo_node().await;
+    let t = Remote::new(Some(&node.trusted_key));
+    let (tx, mut rx) = channel::open_with(&node.url, t.clone(), Some(&node.trusted_key), None).await.unwrap();
+    tx.send(b"ping").await.unwrap();
+    t.gone.store(true, Ordering::SeqCst);
+    assert!(matches!(next(&mut rx).await, Some(Err(ChannelError::Transport(_)))));
+    assert!(matches!(tx.send(b"again").await, Err(ChannelError::Transport(_))));
+}
+
+#[tokio::test]
+async fn a_terminator_serves_one_session() {
+    let t = LocalTerminator::new(Key::new(None), None).unwrap();
+    t.hello().await.unwrap();
+    assert!(t.hello().await.is_err());
+    assert!(t.seal(b"x").await.is_err(), "nothing is sealed before the handshake");
+}
