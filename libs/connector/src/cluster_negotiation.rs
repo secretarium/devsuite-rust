@@ -1,7 +1,5 @@
 use std::time::Duration;
-use base64::{self, Engine};
 use futures::SinkExt;
-use rand::rngs::OsRng;
 use num_bigint::BigUint;
 use thiserror::Error;
 use tokio::{net::TcpStream, time::timeout};
@@ -11,13 +9,18 @@ use futures_util::stream::{SplitSink, SplitStream, StreamExt};
 use tokio_tungstenite::WebSocketStream;
 use p256::ecdsa::{signature, Signature, VerifyingKey};
 use signature::Verifier;
-use aes_gcm::{Aes128Gcm, KeyInit, aead::Error as AesGcmError};
+use aes_gcm::aead::Error as AesGcmError;
 use p256::{EncodedPoint, PublicKey as EcdhPublicKey, SecretKey};
 use elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
 use crate::key::Key;
 use crate::types::SCPSession;
 use crate::utils::{get_random_bytes, get_sha256_bytes, pointwise_xor};
-use crate::scp::{ConnectionState, encrypt_data, decrypt_data};
+use crate::scp::ConnectionState;
+use crate::terminator::{decode_trusted_key, LocalTerminator, TerminationError, Terminator};
+#[cfg(test)]
+use crate::scp::encrypt_data;
+#[cfg(test)]
+use aes_gcm::{Aes128Gcm, KeyInit};
 
 #[derive(Debug, Clone)]
 pub struct UserKey {
@@ -150,7 +153,7 @@ fn pad_to_size(bytes: &[u8], size: usize) -> Vec<u8> {
     }
 }
 
-fn extract_key_and_iv(server_identity_bytes: &[u8], ecdh_secret: &SecretKey) -> Result<(Vec<u8>, Vec<u8>), HandshakeError> {
+pub(crate) fn extract_key_and_iv(server_identity_bytes: &[u8], ecdh_secret: &SecretKey) -> Result<(Vec<u8>, Vec<u8>), HandshakeError> {
     if server_identity_bytes.len() < 32 + 64 + 64 {
         return Err(HandshakeError::Generic("Invalid server identity bytes length".into()));
     }
@@ -193,20 +196,60 @@ fn der_signature_to_raw(
     Ok(signed_nonce)
 }
 
-pub async fn process<'a>(
+/// The client's proof of identity: nonce (32) || ECDH public key (64) || user public key (64) || the user key's
+/// signature of the nonce (64, r then s).
+pub(crate) fn client_proof_of_identity(user_key: &Key, nonce: &[u8], ecdh_pub_key_raw: &[u8]) -> Result<Vec<u8>, HandshakeError> {
+    let signing_key = UserKey::new(user_key.get_raw_private_key().to_vec().as_slice())
+        .map_err(|_| HandshakeError::Generic("Failed to create signing key".into()))?
+        .get_signing_key();
+    let (signature, _recovery_id) = signing_key.sign_recoverable(nonce).map_err(HandshakeError::Ecdsa)?;
+    let signed_nonce = der_signature_to_raw(user_key, &signature)?;
+    Ok([nonce, ecdh_pub_key_raw, &user_key.get_raw_public_key(), &signed_nonce].concat())
+}
+
+/// Checks the decrypted server proof of identity (random 32 || signature 64 of random || welcome) against the key
+/// the server presented in its identity.
+pub(crate) fn verify_server_proof(server_proof_of_identity: &[u8], server_ecdsa_pub_key_bytes: &[u8]) -> Result<(), HandshakeError> {
+    if server_proof_of_identity.len() < 96 {
+        return Err(HandshakeError::Generic("Server proof of identity is too short".into()));
+    }
+    let welcome = b"Hey you! Welcome to Secretarium!";
+    let to_verify = [&server_proof_of_identity[0..32], welcome].concat();
+
+    let server_signature = Signature::from_slice(&server_proof_of_identity[32..96])
+        .map_err(|_| HandshakeError::Generic("Invalid server signature".into()))?;
+    let server_ecdsa_verifying_key = EncodedPoint::from_bytes([&[0x04], server_ecdsa_pub_key_bytes].concat())
+        .ok()
+        .and_then(|point| VerifyingKey::from_encoded_point(&point).ok())
+        .ok_or_else(|| HandshakeError::Generic("Invalid server ECDSA public key".into()))?;
+    if server_ecdsa_verifying_key.verify(&to_verify, &server_signature).is_err() {
+        return Err(HandshakeError::Generic("ECDSA verification failed".into()));
+    }
+    Ok(())
+}
+
+fn terminated(e: TerminationError) -> HandshakeError {
+    match e {
+        TerminationError::Invalid(m) if m.contains("trusted key") => HandshakeError::UntrustedServer,
+        e => HandshakeError::Generic(e.to_string()),
+    }
+}
+
+/// The handshake with the cryptography done by `terminator`: this side only relays the messages (and makes the
+/// proof of work, which is public).
+pub async fn negotiate<'a>(
     mut writer: &mut SplitSink<&mut WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
     mut reader: &mut SplitStream<&mut WebSocketStream<MaybeTlsStream<TcpStream>>>,
-    user_key: &Key,
+    terminator: &dyn Terminator,
     known_trusted_key: Option<&str>,
     connect_timeout: Duration,
-) -> Result<(SCPSession, ConnectionState), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ConnectionState, HandshakeError> {
 
     // --- Client Hello ---
-    let ecdh_private_key = SecretKey::random(&mut OsRng);    
-    let ecdh_pub_key_raw = ecdh_private_key.public_key().to_sec1_bytes()[1..].to_vec();
+    let ecdh_pub_key_raw = terminator.hello().await.map_err(terminated)?;
     if ecdh_pub_key_raw.len() != 64 {
-        return Err(HandshakeError::Generic("Invalid ECDH public key length".into()).into());
-    }    
+        return Err(HandshakeError::Generic("Invalid ECDH public key length".into()));
+    }
     send_bytes(&mut writer, &ecdh_pub_key_raw).await?;
 
     // --- Server Hello ---
@@ -215,19 +258,10 @@ pub async fn process<'a>(
 
     // --- Client Proof of Work ---
     let pow = compute_proof_of_work(server_random);
-    let trusted_key =  match known_trusted_key {
-        Some(key) => {
-            let temp = base64::engine::general_purpose::URL_SAFE.decode(key)?;
-            if temp.len() != 64 {
-                return Err(HandshakeError::Generic("Invalid trusted key length".into()).into());
-            }
-            temp
-        }
-        None => {
-            //Random key with 64 bytes
-            let temp = get_random_bytes(64);
-            temp
-        }
+    let trusted_key = match known_trusted_key {
+        Some(key) => decode_trusted_key(key).map_err(terminated)?,
+        //Random key with 64 bytes
+        None => get_random_bytes(64),
     };
     let client_proof_of_work = [pow, trusted_key.clone()].concat();
 
@@ -240,57 +274,31 @@ pub async fn process<'a>(
     // cluster's trusted key, the server must present exactly that key, otherwise any server holding
     // any key could complete the handshake. (Without a known trusted key, the server is not authenticated.)
     if known_trusted_key.is_some() && server_identity_bytes[96..160] != trusted_key[..] {
-        return Err(HandshakeError::UntrustedServer.into());
+        return Err(HandshakeError::UntrustedServer);
     }
 
-    let (key, iv) = extract_key_and_iv(&server_identity_bytes, &ecdh_private_key)?;
-    let crypto_key = Aes128Gcm::new(key.as_slice().into());
-    let session = SCPSession { crypto_key, iv: iv.try_into().map_err(|_| HandshakeError::Generic("Failed to create IV".into()))? };
-
     // --- Client Proof of Identity ---
-    let public_key_raw = user_key.get_raw_public_key();
-    let nonce = get_random_bytes(32);    
-
-    let signing_key = UserKey::new(user_key.get_raw_private_key().to_vec().as_slice())
-    .map_err(|_| HandshakeError::Generic("Failed to create signing key".into()))?
-    .get_signing_key();
-    let (signature, _recovery_id) = signing_key.sign_recoverable(&nonce).map_err(HandshakeError::Ecdsa)?;
-    let signed_nonce = der_signature_to_raw(user_key, &signature)?;
-
-    let client_proof_of_identity = [nonce, ecdh_pub_key_raw, public_key_raw, signed_nonce].concat();
-
-    let iv_offset = get_random_bytes(16);    
-    let encrypted_client_proof_of_identity = {
-        encrypt_data(&session, &client_proof_of_identity, &iv_offset)?
-    };
-
+    let encrypted_client_proof_of_identity = terminator.identify(&server_identity_bytes).await.map_err(terminated)?;
     send_bytes(&mut writer, &encrypted_client_proof_of_identity).await?;
 
     // --- Server Proof of Identity ---
     let server_proof_of_identity_encrypted = read_n_bytes(& mut reader, 64 + 64, connect_timeout).await?;
-    let server_proof_of_identity = {
-        decrypt_data(&session, &server_proof_of_identity_encrypted)?
-    };
+    terminator.confirm(&server_proof_of_identity_encrypted).await.map_err(terminated)?;
 
-    if server_proof_of_identity.len() < 96 {
-        return Err(HandshakeError::Generic("Server proof of identity is too short".into()).into());
-    }
-    let welcome = b"Hey you! Welcome to Secretarium!";
-    let to_verify = [&server_proof_of_identity[0..32], welcome].concat();
+    Ok(ConnectionState::OPEN)
+}
 
-    let server_signature = Signature::from_slice(&server_proof_of_identity[32..96])
-        .map_err(|_| HandshakeError::Generic("Invalid server signature".into()))?;
-    let server_ecdsa_pub_key_bytes = &server_identity_bytes[96..160];
-
-    let server_ecdsa_verifying_key = EncodedPoint::from_bytes([&[0x04], server_ecdsa_pub_key_bytes].concat())
-        .ok()
-        .and_then(|point| VerifyingKey::from_encoded_point(&point).ok())
-        .ok_or_else(|| HandshakeError::Generic("Invalid server ECDSA public key".into()))?;
-    if server_ecdsa_verifying_key.verify(&to_verify, &server_signature).is_err() {
-        return Err(HandshakeError::Generic("ECDSA verification failed".into()).into());
-    }        
-
-    Ok((session, ConnectionState::OPEN))
+pub async fn process<'a>(
+    writer: &mut SplitSink<&mut WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+    reader: &mut SplitStream<&mut WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    user_key: &Key,
+    known_trusted_key: Option<&str>,
+    connect_timeout: Duration,
+) -> Result<(SCPSession, ConnectionState), HandshakeError> {
+    let terminator = LocalTerminator::new(user_key.clone(), known_trusted_key).map_err(terminated)?;
+    let state = negotiate(writer, reader, &terminator, known_trusted_key, connect_timeout).await?;
+    let session = terminator.session().ok_or_else(|| HandshakeError::Generic("no session".into()))?;
+    Ok((session, state))
 }
 
 #[cfg(test)]
